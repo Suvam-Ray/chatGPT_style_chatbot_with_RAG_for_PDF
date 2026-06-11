@@ -1,5 +1,5 @@
 import streamlit as st
-from langgraph_backend import chatbot, llm
+from langgraph_backend import chatbot, llm, retrieve_all_threads, retrieve_all_thread_titles, save_thread_title, delete_thread
 from langchain_core.messages import HumanMessage, AIMessage
 from pydantic import BaseModel, Field
 import uuid
@@ -57,6 +57,28 @@ def edit_title_dialog(thread_id):
     )
     if st.button("OK"):
         st.session_state['chat_titles'][thread_id] = new_title
+        save_thread_title(thread_id, new_title)
+        st.rerun()
+
+@st.dialog("Delete conversation")
+def delete_thread_dialog(thread_id):
+    # Confirm before permanently deleting a conversation from the database.
+    st.warning("This is a permanent action and will delete this conversation permanently. Are you sure?")
+    yes_col, no_col = st.columns(2)
+    if yes_col.button("Yes"):
+        delete_thread(thread_id)
+        st.session_state['chat_threads'].remove(thread_id)
+        st.session_state['chat_titles'].pop(thread_id, None)
+        if st.session_state['thread_id'] == thread_id:
+            new_chat_thread = next(
+                (tid for tid in st.session_state['chat_threads'] if st.session_state['chat_titles'].get(tid) == 'New chat'),
+                None
+            )
+            st.session_state['message_history'] = []
+            st.session_state['thread_id'] = new_chat_thread or generate_thread_id()
+            add_thread(st.session_state['thread_id'])
+        st.rerun()
+    if no_col.button("No"):
         st.rerun()
 
 
@@ -71,11 +93,15 @@ if 'thread_id' not in st.session_state:
 
 # Store all thread UUIDs shown in the sidebar.
 if 'chat_threads' not in st.session_state:
-    st.session_state['chat_threads'] = []
+    st.session_state['chat_threads'] = retrieve_all_threads()
 
 # Store display titles separately from internal thread UUIDs.
 if 'chat_titles' not in st.session_state:
-    st.session_state['chat_titles'] = {}
+    st.session_state['chat_titles'] = retrieve_all_thread_titles()
+
+# Give database-loaded threads a default title if no UI title exists yet.
+for thread_id in st.session_state['chat_threads']:
+    st.session_state['chat_titles'].setdefault(thread_id, 'New chat')
 
 # Ensure the current thread is listed in the sidebar.
 add_thread(st.session_state['thread_id'])
@@ -94,7 +120,7 @@ st.sidebar.header('My Conversations')
 for thread_id in st.session_state['chat_threads'][::-1]:
     # Show newest conversations first with their display title.
     title = st.session_state['chat_titles'].get(thread_id, 'New chat')
-    title_col, edit_col = st.sidebar.columns([0.82, 0.18])
+    title_col, edit_col, delete_col = st.sidebar.columns([0.70, 0.15, 0.15])
 
     if title_col.button(title, key=str(thread_id)):
         # Load the selected conversation into the main chat area.
@@ -117,6 +143,10 @@ for thread_id in st.session_state['chat_threads'][::-1]:
         edit_title_dialog(thread_id)
 
 
+    if title != 'New chat' and delete_col.button('X', key=f'delete_{thread_id}'):
+        delete_thread_dialog(thread_id)
+
+
 # **************************************** Main UI ************************************
 
 # Replay the current conversation history on every Streamlit rerun.
@@ -134,7 +164,13 @@ if user_input:
         st.text(user_input)
 
     # Use the current thread id so LangGraph stores messages in the right conversation.
-    CONFIG = {'configurable': {'thread_id': st.session_state['thread_id']}}
+    CONFIG = {
+        "configurable": {"thread_id": st.session_state["thread_id"]},
+        "metadata": {
+            "thread_id": st.session_state["thread_id"]
+        },
+        "run_name": "chat_turn",
+    }
 
     # Stream only assistant tokens into the assistant chat bubble.
     with st.chat_message("assistant"):
@@ -155,5 +191,7 @@ if user_input:
 
     # Generate the sidebar title once, after the first full assistant response.
     if st.session_state['chat_titles'].get(st.session_state['thread_id']) == 'New chat':
-        st.session_state['chat_titles'][st.session_state['thread_id']] = generate_conversation_title(user_input, ai_message)
+        title = generate_conversation_title(user_input, ai_message)
+        st.session_state['chat_titles'][st.session_state['thread_id']] = title
+        save_thread_title(st.session_state['thread_id'], title)
         st.rerun()
