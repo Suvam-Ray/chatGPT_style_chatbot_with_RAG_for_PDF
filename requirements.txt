@@ -4,7 +4,12 @@ langgraph-checkpoint-sqlite
 langchain-community
 langchain-core
 langchain-groq
+langchain-huggingface
+langchain-text-splitters
 pydantic
 python-dotenv
+pypdf
 requests
 duckduckgo-search
+sentence-transformers
+faiss-cpu
