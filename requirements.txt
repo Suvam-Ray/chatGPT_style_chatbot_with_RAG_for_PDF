@@ -3,8 +3,10 @@ langgraph
 langgraph-checkpoint-sqlite
 langchain-community
 langchain-core
+langchain-google-genai
 langchain-groq
 langchain-huggingface
+langchain-chroma
 langchain-text-splitters
 pydantic
 python-dotenv
@@ -12,4 +14,4 @@ pypdf
 requests
 duckduckgo-search
 sentence-transformers
-faiss-cpu
+chromadb

@@ -4,45 +4,70 @@ import os
 os.environ["FOR_DISABLE_CONSOLE_CTRL_HANDLER"] = "1"
 
 from langgraph.graph import StateGraph, START, END
-from typing import TypedDict, Annotated, Any, Dict, Optional
+from typing import TypedDict, Annotated, Optional
 
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langchain_groq import ChatGroq
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_community.tools import DuckDuckGoSearchRun
-from langchain_community.vectorstores import FAISS
 from langchain_core.tools import tool
+from langchain_chroma import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from dotenv import load_dotenv
 import sqlite3
 import requests
 import tempfile
+import shutil
 
 load_dotenv()
 
-llm = ChatGroq(model="qwen/qwen3-32b")
+llm=ChatGoogleGenerativeAI(model="gemini-2.5-flash-lite")
 embeddings = None
 
-_THREAD_RETRIEVERS: Dict[str, Any] = {}
-_THREAD_METADATA: Dict[str, dict] = {}
+VECTOR_STORE_DIR = os.path.join("data", "vector_stores")
+os.makedirs(VECTOR_STORE_DIR, exist_ok=True)
 
-def _get_retriever(thread_id: Optional[str]):
-    if thread_id and str(thread_id) in _THREAD_RETRIEVERS:
-        return _THREAD_RETRIEVERS[str(thread_id)]
-    return None
+def _thread_key(thread_id: str) -> str:
+    return str(thread_id)
 
-def ingest_pdf(file_bytes: bytes, thread_id: str, filename: Optional[str] = None) -> dict:
+def _vector_store_path(thread_id: str) -> str:
+    return os.path.join(VECTOR_STORE_DIR, _thread_key(thread_id))
+
+def _collection_name(thread_id: str) -> str:
+    safe_thread_id = _thread_key(thread_id).replace("-", "_")
+    return f"thread_{safe_thread_id}"
+
+def _get_embeddings():
     global embeddings
-    if not file_bytes:
-        raise ValueError("No bytes received for ingestion.")
     if embeddings is None:
         embeddings = HuggingFaceEmbeddings(
             model_name="sentence-transformers/all-miniLM-L6-v2"
         )
+    return embeddings
+
+def _get_vector_store(thread_id: Optional[str]):
+    if not thread_id:
+        return None
+
+    thread_id = _thread_key(thread_id)
+    store_path = _vector_store_path(thread_id)
+    if not os.path.exists(store_path):
+        return None
+
+    return Chroma(
+        collection_name=_collection_name(thread_id),
+        embedding_function=_get_embeddings(),
+        persist_directory=store_path,
+    )
+
+def ingest_pdf(file_bytes: bytes, thread_id: str, filename: Optional[str] = None) -> dict:
+    if not file_bytes:
+        raise ValueError("No bytes received for ingestion.")
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_file:
         temp_file.write(file_bytes)
@@ -59,17 +84,26 @@ def ingest_pdf(file_bytes: bytes, thread_id: str, filename: Optional[str] = None
         )
         chunks = splitter.split_documents(docs)
 
-        vector_store = FAISS.from_documents(chunks, embeddings)
-        retriever = vector_store.as_retriever(search_type="similarity", search_kwargs={"k": 4})
+        source_filename = filename or os.path.basename(temp_path)
+        for chunk in chunks:
+            chunk.metadata["filename"] = source_filename
+            chunk.metadata["thread_id"] = _thread_key(thread_id)
 
-        _THREAD_RETRIEVERS[str(thread_id)] = retriever
-        _THREAD_METADATA[str(thread_id)] = {
-            "filename": filename or os.path.basename(temp_path),
+        store_path = _vector_store_path(thread_id)
+        os.makedirs(store_path, exist_ok=True)
+        vector_store = Chroma(
+            collection_name=_collection_name(thread_id),
+            embedding_function=_get_embeddings(),
+            persist_directory=store_path,
+        )
+        vector_store.add_documents(chunks)
+
+        return {
+            "filename": source_filename,
             "documents": len(docs),
             "chunks": len(chunks),
+            "vector_store_path": store_path,
         }
-
-        return _THREAD_METADATA[str(thread_id)]
     finally:
         try:
             os.remove(temp_path)
@@ -112,16 +146,15 @@ def get_stock_price(symbol: str) -> dict:
 @tool
 def rag_tool(query: str, thread_id: Optional[str] = None) -> dict:
     """Retrieve relevant information from the uploaded PDF for this chat thread."""
-    retriever = _get_retriever(thread_id)
-    if retriever is None:
+    vector_store = _get_vector_store(thread_id)
+    if vector_store is None:
         return {"error": "No document indexed for this chat. Upload a PDF first.", "query": query}
 
-    result = retriever.invoke(query)
+    result = vector_store.similarity_search(query, k=10)
     return {
         "query": query,
         "context": [doc.page_content for doc in result],
         "metadata": [doc.metadata for doc in result],
-        "source_file": _THREAD_METADATA.get(str(thread_id), {}).get("filename"),
     }
 
 tools = [tool for tool in [search_tool, get_stock_price, calculator, rag_tool] if tool is not None]
@@ -137,14 +170,21 @@ def chat_node(state: ChatState, config=None):
 
     system_message = SystemMessage(
         content=(
-            "You are a helpful assistant. For questions about the uploaded PDF, call "
-            "the `rag_tool` and include the thread_id "
-            f"`{thread_id}`. You can also use web search, stock price, and calculator "
-            "tools when helpful. If no document is available, ask the user to upload a PDF."
+            "You are a helpful assistant. If the user asks about an uploaded PDF, "
+            "uploaded document, file, attachment, or says 'this' after uploading a file, "
+            "you must call `rag_tool` before answering. For summaries of uploaded files, "
+            "you must call `rag_tool`. Include the thread_id "
+            f"`{thread_id}` when calling `rag_tool`. You can also use web search, stock "
+            "price, and calculator tools when helpful. If no document is available, ask "
+            "the user to upload a PDF."
         )
     )
     messages = [system_message, *state['messages']]
     response = llm_with_tools.invoke(messages)
+    if thread_id and getattr(response, "tool_calls", None):
+        for tool_call in response.tool_calls:
+            if tool_call.get("name") == "rag_tool":
+                tool_call.setdefault("args", {})["thread_id"] = str(thread_id)
     return {"messages": [response]}
 
 tool_node = ToolNode(tools)
@@ -204,11 +244,9 @@ def delete_thread(thread_id):
     conn.execute("DELETE FROM checkpoints WHERE thread_id = ?", (thread_id,))
     conn.execute("DELETE FROM thread_titles WHERE thread_id = ?", (thread_id,))
     conn.commit()
-    _THREAD_RETRIEVERS.pop(thread_id, None)
-    _THREAD_METADATA.pop(thread_id, None)
+    vector_store_path = _vector_store_path(thread_id)
+    if os.path.exists(vector_store_path):
+        shutil.rmtree(vector_store_path)
 
 def thread_has_document(thread_id: str) -> bool:
-    return str(thread_id) in _THREAD_RETRIEVERS
-
-def thread_document_metadata(thread_id: str) -> dict:
-    return _THREAD_METADATA.get(str(thread_id), {})
+    return os.path.exists(_vector_store_path(thread_id))

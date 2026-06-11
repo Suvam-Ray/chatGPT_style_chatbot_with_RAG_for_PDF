@@ -1,5 +1,5 @@
 import streamlit as st
-from langgraph_backend import chatbot, llm, retrieve_all_threads, retrieve_all_thread_titles, save_thread_title, delete_thread, ingest_pdf, thread_document_metadata
+from langgraph_backend import chatbot, llm, retrieve_all_threads, retrieve_all_thread_titles, save_thread_title, delete_thread, ingest_pdf
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
 from pydantic import BaseModel, Field
 import uuid
@@ -33,6 +33,18 @@ def load_conversation(thread_id):
     # Check if messages key exists in state values, return empty list if not
     return state.values.get('messages', [])
 
+def build_upload_message(filename):
+    # Store PDF upload/indexing as durable conversation history.
+    return HumanMessage(
+        content=f"Uploaded document: {filename}",
+        additional_kwargs={
+            "upload": {
+                "filename": filename,
+                "status": "indexed",
+            }
+        }
+    )
+
 def build_tool_summary(tool_calls):
     # Convert raw tool calls into a compact summary with counts and params.
     tool_summary = {}
@@ -55,6 +67,13 @@ def render_tool_summary(tools):
             for args in tool['args']:
                 st.json(args)
 
+def render_upload_summary(upload):
+    if not upload:
+        return
+    filename = upload.get("filename", "document.pdf")
+    status = upload.get("status", "indexed")
+    st.status(f"PDF {status}: `{filename}`", state="complete", expanded=False)
+
 def convert_messages_to_history(messages):
     # Convert LangGraph messages into Streamlit history and attach tool usage to assistant replies.
     temp_messages = []
@@ -62,7 +81,8 @@ def convert_messages_to_history(messages):
 
     for msg in messages:
         if isinstance(msg, HumanMessage):
-            temp_messages.append({'role': 'user', 'content': msg.content})
+            upload = getattr(msg, "additional_kwargs", {}).get("upload")
+            temp_messages.append({'role': 'user', 'content': msg.content, 'upload': upload})
             pending_tool_calls = []
         elif isinstance(msg, ToolMessage):
             continue
@@ -155,9 +175,6 @@ if 'chat_threads' not in st.session_state:
 if 'chat_titles' not in st.session_state:
     st.session_state['chat_titles'] = retrieve_all_thread_titles()
 
-if 'ingested_docs' not in st.session_state:
-    st.session_state['ingested_docs'] = {}
-
 # Give database-loaded threads a default title if no UI title exists yet.
 for thread_id in st.session_state['chat_threads']:
     st.session_state['chat_titles'].setdefault(thread_id, 'New chat')
@@ -165,7 +182,6 @@ for thread_id in st.session_state['chat_threads']:
 # Ensure the current thread is listed in the sidebar.
 add_thread(st.session_state['thread_id'])
 thread_key = str(st.session_state['thread_id'])
-thread_docs = st.session_state['ingested_docs'].setdefault(thread_key, {})
 
 
 # **************************************** Sidebar UI *********************************
@@ -176,13 +192,6 @@ st.sidebar.title('LangGraph Chatbot')
 if st.sidebar.button('New Chat'):
     reset_chat()
     st.rerun()
-
-if thread_docs:
-    latest_doc = list(thread_docs.values())[-1]
-    st.sidebar.success(
-        f"Using `{latest_doc.get('filename')}` "
-        f"({latest_doc.get('chunks')} chunks from {latest_doc.get('documents')} pages)"
-    )
 
 st.sidebar.header('My Conversations')
 
@@ -195,7 +204,6 @@ for thread_id in st.session_state['chat_threads'][::-1]:
         # Load the selected conversation into the main chat area.
         st.session_state['thread_id'] = thread_id
         thread_key = str(st.session_state['thread_id'])
-        thread_docs = st.session_state['ingested_docs'].setdefault(thread_key, {})
         messages = load_conversation(thread_id)
         st.session_state['message_history'] = convert_messages_to_history(messages)
 
@@ -212,9 +220,12 @@ for thread_id in st.session_state['chat_threads'][::-1]:
 # Replay the current conversation history on every Streamlit rerun.
 for message in st.session_state['message_history']:
     with st.chat_message(message['role']):
+        if message['role'] == 'user':
+            render_upload_summary(message.get('upload'))
         if message['role'] == 'assistant':
             render_tool_summary(message.get('tools', []))
-        st.markdown(message['content'])
+        if not message.get('upload'):
+            st.markdown(message['content'])
 
 chat_input = st.chat_input('Type here', accept_file=True, file_type=["pdf"])
 
@@ -223,17 +234,24 @@ if chat_input:
     uploaded_files = chat_input.files if hasattr(chat_input, "files") else []
 
     for uploaded_pdf in uploaded_files:
-        if uploaded_pdf.name in thread_docs:
-            st.info(f"`{uploaded_pdf.name}` already processed for this chat.")
-        else:
-            with st.status("Indexing PDF...", expanded=True) as status_box:
-                summary = ingest_pdf(
-                    uploaded_pdf.getvalue(),
-                    thread_id=thread_key,
-                    filename=uploaded_pdf.name,
-                )
-                thread_docs[uploaded_pdf.name] = summary
-                status_box.update(label="PDF indexed", state="complete", expanded=False)
+        with st.status("Indexing PDF...", expanded=True) as status_box:
+            ingest_pdf(
+                uploaded_pdf.getvalue(),
+                thread_id=thread_key,
+                filename=uploaded_pdf.name,
+            )
+            status_box.update(label="PDF indexed", state="complete", expanded=False)
+        upload_message = build_upload_message(uploaded_pdf.name)
+        chatbot.update_state(
+            config={"configurable": {"thread_id": thread_key}},
+            values={"messages": [upload_message]},
+            as_node="chat_node",
+        )
+        st.session_state['message_history'].append({
+            'role': 'user',
+            'content': upload_message.content,
+            'upload': upload_message.additional_kwargs["upload"],
+        })
 
     if not user_input:
         st.rerun()
@@ -296,13 +314,6 @@ if chat_input:
 
     # Save the complete assistant response after streaming finishes.
     st.session_state['message_history'].append({'role': 'assistant', 'content': ai_message, 'tools': tools_used})
-
-    doc_meta = thread_document_metadata(thread_key)
-    if doc_meta:
-        st.caption(
-            f"Document indexed: {doc_meta.get('filename')} "
-            f"(chunks: {doc_meta.get('chunks')}, pages: {doc_meta.get('documents')})"
-        )
 
     # Generate the sidebar title once, after the first full assistant response.
     if st.session_state['chat_titles'].get(st.session_state['thread_id']) == 'New chat':
