@@ -1,7 +1,10 @@
 streamlit
 langgraph
 langgraph-checkpoint-sqlite
+langchain-community
 langchain-core
 langchain-groq
 pydantic
 python-dotenv
+requests
+duckduckgo-search

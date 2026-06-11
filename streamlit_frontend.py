@@ -1,6 +1,6 @@
 import streamlit as st
 from langgraph_backend import chatbot, llm, retrieve_all_threads, retrieve_all_thread_titles, save_thread_title, delete_thread
-from langchain_core.messages import HumanMessage, AIMessage
+from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
 from pydantic import BaseModel, Field
 import uuid
 
@@ -32,6 +32,62 @@ def load_conversation(thread_id):
     state = chatbot.get_state(config={'configurable': {'thread_id': thread_id}})
     # Check if messages key exists in state values, return empty list if not
     return state.values.get('messages', [])
+
+def build_tool_summary(tool_calls):
+    # Convert raw tool calls into a compact summary with counts and params.
+    tool_summary = {}
+    for tool_call in tool_calls:
+        tool_name = tool_call.get('name', 'tool')
+        tool_args = tool_call.get('args', {})
+        tool_summary.setdefault(tool_name, {'name': tool_name, 'count': 0, 'args': []})
+        tool_summary[tool_name]['count'] += 1
+        tool_summary[tool_name]['args'].append(tool_args)
+    return list(tool_summary.values())
+
+def render_tool_summary(tools):
+    # Render the retained tool usage box for current and previous responses.
+    if not tools:
+        return
+    label = ', '.join(f"{tool['name']} x{tool['count']}" for tool in tools)
+    with st.status(f"Tools used: {label}", state="complete", expanded=False):
+        for tool in tools:
+            st.markdown(f"- `{tool['name']}` called {tool['count']} time(s)")
+            for args in tool['args']:
+                st.json(args)
+
+def convert_messages_to_history(messages):
+    # Convert LangGraph messages into Streamlit history and attach tool usage to assistant replies.
+    temp_messages = []
+    pending_tool_calls = []
+
+    for msg in messages:
+        if isinstance(msg, HumanMessage):
+            temp_messages.append({'role': 'user', 'content': msg.content})
+            pending_tool_calls = []
+        elif isinstance(msg, ToolMessage):
+            continue
+        else:
+            tool_calls = getattr(msg, 'tool_calls', [])
+            if tool_calls:
+                pending_tool_calls.extend(tool_calls)
+            if msg.content:
+                temp_messages.append({
+                    'role': 'assistant',
+                    'content': msg.content,
+                    'tools': build_tool_summary(pending_tool_calls)
+                })
+                pending_tool_calls = []
+
+    return temp_messages
+
+def get_last_tool_summary(thread_id):
+    # Read the latest saved thread state and return tools used for the last assistant response.
+    messages = load_conversation(thread_id)
+    history = convert_messages_to_history(messages)
+    for message in reversed(history):
+        if message['role'] == 'assistant':
+            return message.get('tools', [])
+    return []
 
 class ConversationTitle(BaseModel):
     # Pydantic schema used to force the LLM to return a clean title field.
@@ -126,18 +182,7 @@ for thread_id in st.session_state['chat_threads'][::-1]:
         # Load the selected conversation into the main chat area.
         st.session_state['thread_id'] = thread_id
         messages = load_conversation(thread_id)
-
-        temp_messages = []
-
-        for msg in messages:
-            # Convert LangChain message objects into Streamlit chat roles.
-            if isinstance(msg, HumanMessage):
-                role='user'
-            else:
-                role='assistant'
-            temp_messages.append({'role': role, 'content': msg.content})
-
-        st.session_state['message_history'] = temp_messages
+        st.session_state['message_history'] = convert_messages_to_history(messages)
 
     if title != 'New chat' and edit_col.button('✎', key=f'edit_{thread_id}'):
         edit_title_dialog(thread_id)
@@ -152,6 +197,8 @@ for thread_id in st.session_state['chat_threads'][::-1]:
 # Replay the current conversation history on every Streamlit rerun.
 for message in st.session_state['message_history']:
     with st.chat_message(message['role']):
+        if message['role'] == 'assistant':
+            render_tool_summary(message.get('tools', []))
         st.markdown(message['content'])
 
 user_input = st.chat_input('Type here')
@@ -174,20 +221,48 @@ if user_input:
 
     # Stream only assistant tokens into the assistant chat bubble.
     with st.chat_message("assistant"):
+        # Keep one status box for tool execution updates during this response.
+        status_holder = {"box": None}
+
         def ai_only_stream():
             for message_chunk, metadata in chatbot.stream(
                 {"messages": [HumanMessage(content=user_input)]},
                 config=CONFIG,
                 stream_mode="messages"
             ):
+                if isinstance(message_chunk, ToolMessage):
+                    # Show or update the tool status when the graph returns a tool message.
+                    tool_name = getattr(message_chunk, "name", "tool")
+                    if status_holder["box"] is None:
+                        # Create the status box only when a tool is actually used.
+                        status_holder["box"] = st.status(f"Using `{tool_name}` ...", expanded=False)
+                    else:
+                        # Reuse the same status box if multiple tools run.
+                        status_holder["box"].update(
+                            label=f"Using `{tool_name}` ...",
+                            state="running",
+                            expanded=False,
+                        )
+
                 if isinstance(message_chunk, AIMessage):
                     # Yield only assistant tokens, not user or system messages.
                     yield message_chunk.content
 
         ai_message = st.write_stream(ai_only_stream())
 
+        tools_used = get_last_tool_summary(st.session_state['thread_id'])
+
+        if status_holder["box"] is not None:
+            # Mark the tool status complete after the assistant response finishes.
+            status_holder["box"].update(
+                label="Tool finished",
+                state="complete",
+                expanded=False,
+            )
+            render_tool_summary(tools_used)
+
     # Save the complete assistant response after streaming finishes.
-    st.session_state['message_history'].append({'role': 'assistant', 'content': ai_message})
+    st.session_state['message_history'].append({'role': 'assistant', 'content': ai_message, 'tools': tools_used})
 
     # Generate the sidebar title once, after the first full assistant response.
     if st.session_state['chat_titles'].get(st.session_state['thread_id']) == 'New chat':
