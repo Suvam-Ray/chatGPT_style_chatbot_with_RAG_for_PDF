@@ -6,12 +6,12 @@ os.environ["FOR_DISABLE_CONSOLE_CTRL_HANDLER"] = "1"
 from langgraph.graph import StateGraph, START, END
 from typing import TypedDict, Annotated, Optional
 
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, AIMessage, ToolMessage
 from langchain_groq import ChatGroq
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph.message import add_messages
-from langgraph.prebuilt import ToolNode, tools_condition
+from langgraph.prebuilt import ToolNode
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_community.tools import DuckDuckGoSearchRun
 from langchain_core.tools import tool
@@ -162,6 +162,48 @@ llm_with_tools = llm.bind_tools(tools)
 
 class ChatState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
+    context_sufficient: bool
+
+def _latest_human_text(messages: list[BaseMessage]) -> str:
+    for message in reversed(messages):
+        if isinstance(message, HumanMessage):
+            return message.content
+    return ""
+
+def _latest_ai_message(messages: list[BaseMessage]):
+    for message in reversed(messages):
+        if isinstance(message, AIMessage):
+            return message
+    return None
+
+def _document_query(text: str) -> bool:
+    text = text.lower()
+    return any(
+        keyword in text
+        for keyword in ["pdf", "document", "file", "attachment", "summary", "summarize", "this"]
+    )
+
+def _rag_tool_calls_since_latest_human(messages: list[BaseMessage]) -> int:
+    count = 0
+    for message in reversed(messages):
+        if isinstance(message, HumanMessage):
+            break
+        if isinstance(message, AIMessage):
+            count += sum(
+                1
+                for tool_call in getattr(message, "tool_calls", [])
+                if tool_call.get("name") == "rag_tool"
+            )
+    return count
+
+def _rag_tool_results_since_latest_human(messages: list[BaseMessage]) -> list[ToolMessage]:
+    results = []
+    for message in reversed(messages):
+        if isinstance(message, HumanMessage):
+            break
+        if isinstance(message, ToolMessage) and getattr(message, "name", None) == "rag_tool":
+            results.append(message)
+    return list(reversed(results))
 
 def chat_node(state: ChatState, config=None):
     thread_id = None
@@ -187,6 +229,68 @@ def chat_node(state: ChatState, config=None):
                 tool_call.setdefault("args", {})["thread_id"] = str(thread_id)
     return {"messages": [response]}
 
+def judge_context_sufficiency(state: ChatState, config=None):
+    messages = state["messages"]
+    user_query = _latest_human_text(messages)
+    rag_results = _rag_tool_results_since_latest_human(messages)
+    latest_ai = _latest_ai_message(messages)
+
+    if not rag_results or not latest_ai or not _document_query(user_query):
+        return {"context_sufficient": True}
+
+    judge_prompt = f"""
+You are checking whether an assistant answer has enough retrieved PDF context.
+
+User question:
+{user_query}
+
+Assistant answer:
+{latest_ai.content}
+
+Retrieved chunk count:
+{len(rag_results)}
+
+Return only one word:
+SUFFICIENT - if the answer is grounded and directly answers the user.
+INSUFFICIENT - if the answer says it lacks the document, asks the user to upload again, is vague, or needs more PDF context.
+"""
+    result = llm.invoke(judge_prompt)
+    verdict = getattr(result, "content", str(result)).strip().upper()
+    return {"context_sufficient": verdict.startswith("SUFFICIENT")}
+
+def retrieve_more_context(state: ChatState, config=None):
+    thread_id = None
+    if config and isinstance(config, dict):
+        thread_id = config.get("configurable", {}).get("thread_id")
+
+    user_query = _latest_human_text(state["messages"])
+    tool_call = {
+        "name": "rag_tool",
+        "args": {
+            "query": f"{user_query}\n\nRetrieve additional relevant context from the uploaded PDF.",
+            "thread_id": str(thread_id),
+        },
+        "id": f"rag_retry_{_rag_tool_calls_since_latest_human(state['messages']) + 1}",
+    }
+    return {"messages": [AIMessage(content="", tool_calls=[tool_call])]}
+
+def route_after_chat(state: ChatState):
+    last_message = state["messages"][-1]
+    if isinstance(last_message, AIMessage) and getattr(last_message, "tool_calls", None):
+        return "tools"
+    return "judge_context_sufficiency"
+
+def route_after_judge(state: ChatState):
+    user_query = _latest_human_text(state["messages"])
+    attempts = _rag_tool_calls_since_latest_human(state["messages"])
+    if (
+        _document_query(user_query)
+        and not state.get("context_sufficient", True)
+        and attempts < 3
+    ):
+        return "retrieve_more_context"
+    return END
+
 tool_node = ToolNode(tools)
 
 DB_DIR = "data"
@@ -208,9 +312,13 @@ checkpointer.setup()
 graph = StateGraph(ChatState)
 graph.add_node("chat_node", chat_node)
 graph.add_node("tools", tool_node)
+graph.add_node("judge_context_sufficiency", judge_context_sufficiency)
+graph.add_node("retrieve_more_context", retrieve_more_context)
 graph.add_edge(START, "chat_node")
-graph.add_conditional_edges("chat_node", tools_condition)
+graph.add_conditional_edges("chat_node", route_after_chat)
 graph.add_edge("tools", "chat_node")
+graph.add_conditional_edges("judge_context_sufficiency", route_after_judge)
+graph.add_edge("retrieve_more_context", "tools")
 
 chatbot = graph.compile(checkpointer=checkpointer)
 

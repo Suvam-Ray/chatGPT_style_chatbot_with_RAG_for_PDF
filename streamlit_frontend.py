@@ -103,11 +103,12 @@ def convert_messages_to_history(messages):
 def get_last_tool_summary(thread_id):
     # Read the latest saved thread state and return tools used for the last assistant response.
     messages = load_conversation(thread_id)
-    history = convert_messages_to_history(messages)
-    for message in reversed(history):
-        if message['role'] == 'assistant':
-            return message.get('tools', [])
-    return []
+    tool_calls = []
+    for msg in reversed(messages):
+        if isinstance(msg, HumanMessage):
+            break
+        tool_calls = getattr(msg, 'tool_calls', []) + tool_calls
+    return build_tool_summary(tool_calls)
 
 class ConversationTitle(BaseModel):
     # Pydantic schema used to force the LLM to return a clean title field.
