@@ -1,6 +1,10 @@
+import os
+# HuggingFace embeddings (via torch/MKL) pull in Intel Fortran runtime which
+# hijacks Ctrl+C and crashes Streamlit on shutdown. Disabling with following.
+os.environ["FOR_DISABLE_CONSOLE_CTRL_HANDLER"] = "1"
+
 from langgraph.graph import StateGraph, START, END
 from typing import TypedDict, Annotated, Any, Dict, Optional
-import os
 
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langchain_groq import ChatGroq
